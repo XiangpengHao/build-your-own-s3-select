@@ -1,0 +1,15 @@
+[package]
+name = "build-your-own-s3-select"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+arrow-flight = { version = "54.2.1", features = ["flight-sql-experimental"] }
+datafusion = "46.0.1"
+tokio = { version = "1.44.1", features = ["rt-multi-thread"] }
+tonic = { version = "0.12.0" }
+prost = "0.13.5"
+futures = "0.3.31"
+async-trait = "0.1.88"
+arrow = "54.3.0"
+bytes = "1.10.1"
