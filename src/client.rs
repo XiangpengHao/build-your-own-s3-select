@@ -3,18 +3,14 @@ use arrow::{
     datatypes::{SchemaRef, ToByteSlice},
 };
 use arrow_flight::{
-    Action, FlightClient, FlightEndpoint, FlightInfo, Ticket,
+    FlightClient, FlightEndpoint, FlightInfo, Ticket,
     flight_service_client::FlightServiceClient,
-    sql::{CommandGetDbSchemas, ProstMessageExt, client::FlightSqlServiceClient},
+    sql::{CommandGetDbSchemas, client::FlightSqlServiceClient},
 };
 use datafusion::{
     catalog::{Session, TableProvider},
     common::{ToDFSchema, project_schema},
-    datasource::{
-        DefaultTableSource, TableType,
-        empty::EmptyTable,
-        schema_adapter::{DefaultSchemaAdapterFactory, SchemaMapper},
-    },
+    datasource::{DefaultTableSource, TableType, empty},
     error::{DataFusionError, Result},
     execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext},
     logical_expr::{LogicalPlan, TableProviderFilterPushDown, TableScan},
@@ -33,7 +29,7 @@ use datafusion::{
 use futures::{Stream, TryStreamExt, future::BoxFuture};
 use std::task::{Context, Poll, ready};
 use std::{any::Any, pin::Pin, sync::Arc};
-use tonic::{Request, async_trait, transport::Channel};
+use tonic::{async_trait, transport::Channel};
 
 #[derive(Clone, Debug)]
 pub(crate) struct FlightMetadata {
@@ -56,7 +52,6 @@ impl FlightMetadata {
 pub struct FlightExec {
     config: FlightConfig,
     plan_properties: PlanProperties,
-    flight_schema: SchemaRef,
 }
 
 impl FlightExec {
@@ -90,7 +85,6 @@ impl FlightExec {
         Ok(Self {
             config,
             plan_properties,
-            flight_schema: output_schema,
         })
     }
 }
@@ -148,10 +142,8 @@ async fn flight_stream(
     schema: SchemaRef,
 ) -> Result<SendableRecordBatchStream> {
     let mut client = flight_client(partition.locations).await?;
-
     let ticket = Ticket::new(partition.ticket.0.to_vec());
     let stream = client.do_get(ticket).await.unwrap().map_err(to_df_err);
-
     Ok(Box::pin(RecordBatchStreamAdapter::new(
         schema.clone(),
         stream,
@@ -208,15 +200,10 @@ impl ExecutionPlan for FlightExec {
         _context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let future_stream = flight_stream(self.config.partitions[partition].clone(), self.schema());
-        let (schema_adapter, _) = DefaultSchemaAdapterFactory::from_schema(self.schema())
-            .map_schema(self.flight_schema.as_ref())
-            .unwrap();
         Ok(Box::pin(FlightStream {
-            _partition: partition,
             state: FlightStreamState::Init,
             future_stream: Some(Box::pin(future_stream)),
             schema: self.schema(),
-            schema_mapper: schema_adapter,
         }))
     }
 }
@@ -228,11 +215,9 @@ enum FlightStreamState {
 }
 
 struct FlightStream {
-    _partition: usize,
     state: FlightStreamState,
     future_stream: Option<BoxFuture<'static, Result<SendableRecordBatchStream>>>,
     schema: SchemaRef,
-    schema_mapper: Arc<dyn SchemaMapper>,
 }
 
 impl Stream for FlightStream {
@@ -257,10 +242,7 @@ impl Stream for FlightStream {
             }
         };
         match result {
-            Poll::Ready(Some(Ok(batch))) => {
-                let new_batch = self.schema_mapper.map_batch(batch).unwrap();
-                Poll::Ready(Some(Ok(new_batch)))
-            }
+            Poll::Ready(Some(Ok(batch))) => Poll::Ready(Some(Ok(batch))),
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Ready(Some(Err(e))) => {
                 panic!("Error reading flight stream: {}", e);
@@ -287,16 +269,9 @@ impl FlightSqlDriver {
         table_url: &str,
     ) -> FlightMetadata {
         let mut client = FlightSqlServiceClient::new(channel);
-        let request = RegisterTableRequest {
-            url: table_url.to_string(),
-            table_name: table_name.to_string(),
-        };
-        let request = request.into();
-        let request = Request::new(request);
-        client.do_action(request).await.unwrap();
         let request = CommandGetDbSchemas {
             db_schema_filter_pattern: Some(table_name.to_string()),
-            ..Default::default()
+            catalog: Some(table_url.to_string()),
         };
         let info = client.get_db_schemas(request).await.unwrap();
         FlightMetadata::from_info(info)
@@ -359,7 +334,7 @@ impl TableProvider for PushdownTable {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let unparsed_sql = {
             // we don't care about actual source for the purpose of unparsing the sql.
-            let empty_table_provider = EmptyTable::new(self.schema().clone());
+            let empty_table_provider = empty::EmptyTable::new(self.schema().clone());
             let table_source = Arc::new(DefaultTableSource::new(Arc::new(empty_table_provider)));
 
             let logical_plan = TableScan {
@@ -406,60 +381,29 @@ impl TableProvider for PushdownTable {
                 },
             )
             .collect();
-
         Ok(filter_push_down)
     }
 }
 
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct RegisterTableRequest {
-    #[prost(string, tag = "1")]
-    pub url: ::prost::alloc::string::String,
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut session_config = SessionConfig::from_env()?;
+    session_config
+        .options_mut()
+        .execution
+        .parquet
+        .pushdown_filters = true;
+    let ctx = Arc::new(SessionContext::new_with_config(session_config));
 
-    #[prost(string, tag = "2")]
-    pub table_name: ::prost::alloc::string::String,
-}
+    let cache_server = "http://localhost:50051";
+    let table_name = "aws-edge-locations";
+    let table_url = "./aws-edge-locations.parquet";
+    let sql = format!(
+        "SELECT DISTINCT \"city\" FROM \"{table_name}\" WHERE \"country\" = 'United States'"
+    );
 
-impl From<RegisterTableRequest> for Action {
-    fn from(request: RegisterTableRequest) -> Self {
-        use prost::Message;
-        Action {
-            r#type: "RegisterTable".to_string(),
-            body: request.as_any().encode_to_vec().into(),
-        }
-    }
-}
-
-impl ProstMessageExt for RegisterTableRequest {
-    fn type_url() -> &'static str {
-        "type.googleapis.com/datafusion.example.com.sql.ActionRegisterTableRequest"
-    }
-
-    fn as_any(&self) -> arrow_flight::sql::Any {
-        arrow_flight::sql::Any {
-            type_url: RegisterTableRequest::type_url().to_string(),
-            value: ::prost::Message::encode_to_vec(self).into(),
-        }
-    }
-}
-
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct FetchResults {
-    #[prost(uint64, tag = "1")]
-    pub handle: u64,
-    #[prost(uint32, tag = "2")]
-    pub partition: u32,
-}
-
-impl ProstMessageExt for FetchResults {
-    fn type_url() -> &'static str {
-        "type.googleapis.com/datafusion.example.com.sql.FetchResults"
-    }
-
-    fn as_any(&self) -> arrow_flight::sql::Any {
-        arrow_flight::sql::Any {
-            type_url: FetchResults::type_url().to_string(),
-            value: ::prost::Message::encode_to_vec(self).into(),
-        }
-    }
+    let table = PushdownTable::create(cache_server, table_name, table_url).await;
+    ctx.register_table(table_name, Arc::new(table))?;
+    ctx.sql(&sql).await?.show().await?;
+    Ok(())
 }

@@ -1,13 +1,11 @@
 use arrow_flight::{
-    Action, FlightDescriptor, FlightEndpoint, FlightInfo, Ticket,
+    FlightDescriptor, FlightEndpoint, FlightInfo, Ticket,
     encode::FlightDataEncoderBuilder,
     flight_service_server::{FlightService, FlightServiceServer},
     sql::{
         Any, CommandGetDbSchemas, CommandStatementQuery, ProstMessageExt, server::FlightSqlService,
     },
 };
-use build_your_own_s3_select::{FetchResults, RegisterTableRequest};
-use bytes::Bytes;
 use datafusion::{
     physical_plan::{ExecutionPlan, ExecutionPlanProperties},
     prelude::*,
@@ -20,20 +18,11 @@ use std::{
 };
 use tonic::{Request, Response, Status, transport::Server};
 
+#[derive(Default)]
 struct PushdownServer {
     execution_plans: Mutex<HashMap<u64, Arc<dyn ExecutionPlan>>>,
     next_id: atomic::AtomicU64,
     ctx: SessionContext,
-}
-
-impl PushdownServer {
-    fn new() -> Self {
-        Self {
-            execution_plans: Mutex::new(HashMap::new()),
-            next_id: atomic::AtomicU64::new(0),
-            ctx: SessionContext::new(),
-        }
-    }
 }
 
 #[tonic::async_trait]
@@ -47,7 +36,12 @@ impl FlightSqlService for PushdownServer {
         query: CommandGetDbSchemas,
         _request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
+        let table_url = query.catalog.unwrap();
         let table_name = query.db_schema_filter_pattern.unwrap();
+        _ = self
+            .ctx
+            .register_parquet(&table_name, table_url, Default::default())
+            .await;
         let schema = self.ctx.table_provider(&table_name).await.unwrap().schema();
         let info = FlightInfo::new().try_with_schema(&schema).unwrap();
         Ok(Response::new(info))
@@ -102,22 +96,26 @@ impl FlightSqlService for PushdownServer {
             encoder.map(|result| result.map_err(|e| Status::internal(e.to_string())));
         Ok(Response::new(Box::pin(response_stream)))
     }
+}
 
-    async fn do_action_fallback(
-        &self,
-        request: Request<Action>,
-    ) -> Result<Response<<Self as FlightService>::DoActionStream>, Status> {
-        let action = request.into_inner();
-        let any = Any::decode(action.body).unwrap();
-        let request = any.unpack::<RegisterTableRequest>().unwrap().unwrap();
-        _ = self
-            .ctx
-            .register_parquet(request.table_name, request.url, Default::default())
-            .await;
-        let output = futures::stream::iter(vec![Ok(arrow_flight::Result {
-            body: Bytes::default(),
-        })]);
-        Ok(Response::new(Box::pin(output)))
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct FetchResults {
+    #[prost(uint64, tag = "1")]
+    pub handle: u64,
+    #[prost(uint32, tag = "2")]
+    pub partition: u32,
+}
+
+impl ProstMessageExt for FetchResults {
+    fn type_url() -> &'static str {
+        "type.googleapis.com/datafusion.example.com.sql.FetchResults"
+    }
+
+    fn as_any(&self) -> arrow_flight::sql::Any {
+        arrow_flight::sql::Any {
+            type_url: FetchResults::type_url().to_string(),
+            value: ::prost::Message::encode_to_vec(self).into(),
+        }
     }
 }
 
@@ -125,7 +123,7 @@ impl FlightSqlService for PushdownServer {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = "127.0.0.1:50051".parse()?;
     Server::builder()
-        .add_service(FlightServiceServer::new(PushdownServer::new()))
+        .add_service(FlightServiceServer::new(PushdownServer::default()))
         .serve(addr)
         .await?;
     Ok(())
