@@ -4,7 +4,6 @@ use arrow::{
 };
 use arrow_flight::{
     Action, FlightClient, FlightEndpoint, FlightInfo, Ticket,
-    error::FlightError,
     flight_service_client::FlightServiceClient,
     sql::{CommandGetDbSchemas, ProstMessageExt, client::FlightSqlServiceClient},
 };
@@ -25,21 +24,15 @@ use datafusion::{
         execution_plan::{Boundedness, EmissionType},
         stream::RecordBatchStreamAdapter,
     },
-    prelude::Expr,
+    prelude::*,
     sql::{
         TableReference,
         unparser::{Unparser, dialect::PostgreSqlDialect},
     },
 };
 use futures::{Stream, TryStreamExt, future::BoxFuture};
-use std::{
-    any::Any,
-    error::Error,
-    fmt::{Debug, Formatter},
-    pin::Pin,
-    sync::Arc,
-    task::{Context, Poll, ready},
-};
+use std::task::{Context, Poll, ready};
+use std::{any::Any, pin::Pin, sync::Arc};
 use tonic::{Request, async_trait, transport::Channel};
 
 #[derive(Clone, Debug)]
@@ -53,10 +46,9 @@ impl FlightMetadata {
         Self { info, schema }
     }
 
-    #[allow(clippy::result_large_err)]
-    pub fn try_new(info: FlightInfo) -> arrow_flight::error::Result<Self> {
-        let schema = Arc::new(info.clone().try_decode_schema()?);
-        Ok(Self::new(info, schema))
+    pub fn from_info(info: FlightInfo) -> Self {
+        let schema = Arc::new(info.clone().try_decode_schema().unwrap());
+        Self::new(info, schema)
     }
 }
 
@@ -68,8 +60,6 @@ pub struct FlightExec {
 }
 
 impl FlightExec {
-    /// Creates a FlightExec with the provided [FlightMetadata]
-    /// and origin URL (used as fallback location as per the protocol spec).
     pub(crate) fn try_new(
         output_schema: SchemaRef,
         metadata: FlightMetadata,
@@ -112,7 +102,6 @@ pub(crate) struct FlightConfig {
     limit: Option<usize>,
 }
 
-/// The minimum information required for fetching a flight stream.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct FlightPartition {
     locations: String,
@@ -132,8 +121,8 @@ impl From<Option<&Ticket>> for FlightTicket {
     }
 }
 
-impl Debug for FlightTicket {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+impl std::fmt::Debug for FlightTicket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "[..{} bytes..]", self.0.len())
     }
 }
@@ -169,7 +158,7 @@ async fn flight_stream(
     )))
 }
 
-pub(crate) fn to_df_err<E: Error + Send + Sync + 'static>(err: E) -> DataFusionError {
+pub(crate) fn to_df_err<E: std::error::Error + Send + Sync + 'static>(err: E) -> DataFusionError {
     DataFusionError::External(Box::new(err))
 }
 
@@ -179,7 +168,7 @@ pub(crate) async fn flight_channel(source: impl Into<String>) -> Result<Channel>
 }
 
 impl DisplayAs for FlightExec {
-    fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter) -> std::fmt::Result {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
             "FlightExec: origin={}, streams={}",
@@ -246,9 +235,11 @@ struct FlightStream {
     schema_mapper: Arc<dyn SchemaMapper>,
 }
 
-impl FlightStream {
-    fn poll_inner(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<RecordBatch>>> {
-        loop {
+impl Stream for FlightStream {
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let result: Poll<Option<Result<RecordBatch>>> = loop {
             match &mut self.state {
                 FlightStreamState::Init => {
                     self.state = FlightStreamState::GetStream(self.future_stream.take().unwrap());
@@ -261,18 +252,10 @@ impl FlightStream {
                 }
                 FlightStreamState::Processing(stream) => {
                     let result = stream.as_mut().poll_next(cx);
-                    return result;
+                    break result;
                 }
             }
-        }
-    }
-}
-
-impl Stream for FlightStream {
-    type Item = Result<RecordBatch>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let result = self.poll_inner(cx);
+        };
         match result {
             Poll::Ready(Some(Ok(batch))) => {
                 let new_batch = self.schema_mapper.map_batch(batch).unwrap();
@@ -293,7 +276,6 @@ impl RecordBatchStream for FlightStream {
     }
 }
 
-/// Default Flight SQL driver.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct FlightSqlDriver {}
 
@@ -303,35 +285,27 @@ impl FlightSqlDriver {
         channel: Channel,
         table_name: &str,
         table_url: &str,
-    ) -> std::result::Result<FlightMetadata, FlightError> {
+    ) -> FlightMetadata {
         let mut client = FlightSqlServiceClient::new(channel);
-
-        {
-            let request = RegisterTableRequest {
-                url: table_url.to_string(),
-                table_name: table_name.to_string(),
-            };
-            let request = request.into();
-            let request = Request::new(request);
-            client.do_action(request).await?;
-        }
-
+        let request = RegisterTableRequest {
+            url: table_url.to_string(),
+            table_name: table_name.to_string(),
+        };
+        let request = request.into();
+        let request = Request::new(request);
+        client.do_action(request).await.unwrap();
         let request = CommandGetDbSchemas {
             db_schema_filter_pattern: Some(table_name.to_string()),
             ..Default::default()
         };
-        let info = client.get_db_schemas(request).await?;
-        FlightMetadata::try_new(info)
+        let info = client.get_db_schemas(request).await.unwrap();
+        FlightMetadata::from_info(info)
     }
 
-    pub async fn run_sql(
-        &self,
-        channel: Channel,
-        sql: &str,
-    ) -> std::result::Result<FlightMetadata, FlightError> {
+    pub async fn run_sql(&self, channel: Channel, sql: &str) -> FlightMetadata {
         let mut client = FlightSqlServiceClient::new(channel);
-        let info = client.execute(sql.to_string(), None).await?;
-        FlightMetadata::try_new(info)
+        let info = client.execute(sql.to_string(), None).await.unwrap();
+        FlightMetadata::from_info(info)
     }
 }
 
@@ -350,8 +324,7 @@ impl PushdownTable {
         let driver = Arc::new(FlightSqlDriver {});
         let metadata = driver
             .metadata(channel.clone(), table_name, table_url)
-            .await
-            .unwrap();
+            .await;
 
         Self {
             driver,
@@ -409,8 +382,7 @@ impl TableProvider for PushdownTable {
         let metadata = self
             .driver
             .run_sql(self.channel.clone(), &unparsed_sql)
-            .await
-            .map_err(to_df_err)?;
+            .await;
 
         Ok(Arc::new(FlightExec::try_new(
             self.output_schema.clone(),
@@ -466,6 +438,27 @@ impl ProstMessageExt for RegisterTableRequest {
     fn as_any(&self) -> arrow_flight::sql::Any {
         arrow_flight::sql::Any {
             type_url: RegisterTableRequest::type_url().to_string(),
+            value: ::prost::Message::encode_to_vec(self).into(),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct FetchResults {
+    #[prost(uint64, tag = "1")]
+    pub handle: u64,
+    #[prost(uint32, tag = "2")]
+    pub partition: u32,
+}
+
+impl ProstMessageExt for FetchResults {
+    fn type_url() -> &'static str {
+        "type.googleapis.com/datafusion.example.com.sql.FetchResults"
+    }
+
+    fn as_any(&self) -> arrow_flight::sql::Any {
+        arrow_flight::sql::Any {
+            type_url: FetchResults::type_url().to_string(),
             value: ::prost::Message::encode_to_vec(self).into(),
         }
     }

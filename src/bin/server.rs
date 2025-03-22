@@ -6,37 +6,32 @@ use arrow_flight::{
         Any, CommandGetDbSchemas, CommandStatementQuery, ProstMessageExt, server::FlightSqlService,
     },
 };
-use build_your_own_s3_select::RegisterTableRequest;
+use build_your_own_s3_select::{FetchResults, RegisterTableRequest};
 use bytes::Bytes;
 use datafusion::{
     physical_plan::{ExecutionPlan, ExecutionPlanProperties},
-    prelude::SessionContext,
+    prelude::*,
 };
-use futures::StreamExt;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use prost::Message;
 use std::{
     collections::HashMap,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex, atomic},
 };
 use tonic::{Request, Response, Status, transport::Server};
 
 struct PushdownServer {
     execution_plans: Mutex<HashMap<u64, Arc<dyn ExecutionPlan>>>,
-    next_id: AtomicU64,
+    next_id: atomic::AtomicU64,
     ctx: SessionContext,
 }
 
 impl PushdownServer {
     fn new() -> Self {
-        let ctx = SessionContext::new();
         Self {
             execution_plans: Mutex::new(HashMap::new()),
-            next_id: AtomicU64::new(0),
-            ctx,
+            next_id: atomic::AtomicU64::new(0),
+            ctx: SessionContext::new(),
         }
     }
 }
@@ -52,14 +47,8 @@ impl FlightSqlService for PushdownServer {
         query: CommandGetDbSchemas,
         _request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        println!("getting table schemas");
-        let table_name = query
-            .db_schema_filter_pattern
-            .ok_or(Status::invalid_argument(
-                "db_schema_filter_pattern is required",
-            ))?;
+        let table_name = query.db_schema_filter_pattern.unwrap();
         let schema = self.ctx.table_provider(&table_name).await.unwrap().schema();
-
         let info = FlightInfo::new().try_with_schema(&schema).unwrap();
         Ok(Response::new(info))
     }
@@ -76,7 +65,7 @@ impl FlightSqlService for PushdownServer {
         let physical_plan = state.create_physical_plan(&plan).await.unwrap();
         let partition_count = physical_plan.output_partitioning().partition_count();
         let schema = physical_plan.schema();
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let id = self.next_id.fetch_add(1, atomic::Ordering::Relaxed);
         self.execution_plans
             .lock()
             .unwrap()
@@ -102,23 +91,13 @@ impl FlightSqlService for PushdownServer {
         message: Any,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         let fetch_results: FetchResults = message.unpack().unwrap().unwrap();
-        let handle = fetch_results.handle;
-        let partition = fetch_results.partition;
-        let physical_plan = self
-            .execution_plans
-            .lock()
-            .unwrap()
-            .get(&handle)
-            .unwrap()
-            .clone();
-        let schema = physical_plan.schema();
+        let plan_lock = self.execution_plans.lock().unwrap();
+        let physical_plan = plan_lock.get(&fetch_results.handle).unwrap().clone();
         let stream = physical_plan
-            .execute(partition as usize, self.ctx.task_ctx())
+            .execute(fetch_results.partition as usize, self.ctx.task_ctx())
             .unwrap()
             .map_err(|e| arrow_flight::error::FlightError::ExternalError(Box::new(e)));
-        let encoder = FlightDataEncoderBuilder::new()
-            .with_schema(schema.clone())
-            .build(stream);
+        let encoder = FlightDataEncoderBuilder::new().build(stream);
         let response_stream =
             encoder.map(|result| result.map_err(|e| Status::internal(e.to_string())));
         Ok(Response::new(Box::pin(response_stream)))
@@ -131,35 +110,14 @@ impl FlightSqlService for PushdownServer {
         let action = request.into_inner();
         let any = Any::decode(action.body).unwrap();
         let request = any.unpack::<RegisterTableRequest>().unwrap().unwrap();
-        self.ctx
+        _ = self
+            .ctx
             .register_parquet(request.table_name, request.url, Default::default())
-            .await
-            .unwrap();
+            .await;
         let output = futures::stream::iter(vec![Ok(arrow_flight::Result {
             body: Bytes::default(),
         })]);
         Ok(Response::new(Box::pin(output)))
-    }
-}
-
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct FetchResults {
-    #[prost(uint64, tag = "1")]
-    pub handle: u64,
-    #[prost(uint32, tag = "2")]
-    pub partition: u32,
-}
-
-impl ProstMessageExt for FetchResults {
-    fn type_url() -> &'static str {
-        "type.googleapis.com/datafusion.example.com.sql.FetchResults"
-    }
-
-    fn as_any(&self) -> Any {
-        Any {
-            type_url: FetchResults::type_url().to_string(),
-            value: ::prost::Message::encode_to_vec(self).into(),
-        }
     }
 }
 
