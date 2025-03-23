@@ -1,8 +1,12 @@
 The source code of my blog: [Build your own S3-Select in 400 lines of Rust](https://blog.xiangpeng.systems/posts/build-s3-select/).
 
-### Install Rust
+### Clone and install Rust
 
 ```bash
+git clone https://github.com/XiangpengHao/build-your-own-s3-select.git
+
+cd build-your-own-s3-select
+
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
