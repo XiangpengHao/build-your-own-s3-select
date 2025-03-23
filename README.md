@@ -1,5 +1,7 @@
 The source code of my blog: [Build your own S3-Select in 400 lines of Rust](https://blog.xiangpeng.systems/posts/build-s3-select/).
 
+You may also want to checkout [LiquidCache](https://github.com/XiangpengHao/liquid-cache), a more feature-rich version of this project.
+
 ### Clone and install Rust
 
 ```bash
