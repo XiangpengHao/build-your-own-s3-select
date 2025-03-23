@@ -32,68 +32,39 @@ use std::{any::Any, pin::Pin, sync::Arc};
 use tonic::{async_trait, transport::Channel};
 
 #[derive(Clone, Debug)]
-pub(crate) struct FlightMetadata {
-    info: FlightInfo,
-    schema: SchemaRef,
-}
-
-impl FlightMetadata {
-    pub fn new(info: FlightInfo, schema: SchemaRef) -> Self {
-        Self { info, schema }
-    }
-
-    pub fn from_info(info: FlightInfo) -> Self {
-        let schema = Arc::new(info.clone().try_decode_schema().unwrap());
-        Self::new(info, schema)
-    }
-}
-
-#[derive(Clone, Debug)]
 pub struct FlightExec {
-    config: FlightConfig,
+    server: String,
+    partitions: Arc<[FlightPartition]>,
     plan_properties: PlanProperties,
 }
 
 impl FlightExec {
     pub(crate) fn try_new(
         output_schema: SchemaRef,
-        metadata: FlightMetadata,
+        info: FlightInfo,
         projection: Option<&Vec<usize>>,
         origin: &str,
-        limit: Option<usize>,
     ) -> Result<Self> {
-        let partitions = metadata
-            .info
+        let partitions: Arc<[FlightPartition]> = info
             .endpoint
             .iter()
             .map(|endpoint| FlightPartition::new(endpoint, origin.to_string()))
             .collect();
         let schema = project_schema(&output_schema, projection).expect("Error projecting schema");
-        let config = FlightConfig {
-            origin: origin.into(),
-            partitions,
-            limit,
-        };
 
         let plan_properties = PlanProperties::new(
             EquivalenceProperties::new(schema),
-            datafusion::physical_plan::Partitioning::UnknownPartitioning(config.partitions.len()),
+            datafusion::physical_plan::Partitioning::UnknownPartitioning(partitions.len()),
             EmissionType::Incremental,
             Boundedness::Bounded,
         );
 
         Ok(Self {
-            config,
+            server: origin.to_string(),
+            partitions,
             plan_properties,
         })
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct FlightConfig {
-    origin: String,
-    partitions: Arc<[FlightPartition]>,
-    limit: Option<usize>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -164,8 +135,8 @@ impl DisplayAs for FlightExec {
         write!(
             f,
             "FlightExec: origin={}, streams={}",
-            self.config.origin,
-            self.config.partitions.len(),
+            self.server,
+            self.partitions.len(),
         )
     }
 }
@@ -199,7 +170,7 @@ impl ExecutionPlan for FlightExec {
         partition: usize,
         _context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let future_stream = flight_stream(self.config.partitions[partition].clone(), self.schema());
+        let future_stream = flight_stream(self.partitions[partition].clone(), self.schema());
         Ok(Box::pin(FlightStream {
             state: FlightStreamState::Init,
             future_stream: Some(Box::pin(future_stream)),
@@ -258,67 +229,45 @@ impl RecordBatchStream for FlightStream {
     }
 }
 
-#[derive(Clone, Debug, Default)]
-pub(crate) struct FlightSqlDriver {}
-
-impl FlightSqlDriver {
-    pub async fn metadata(
-        &self,
-        channel: Channel,
-        table_name: &str,
-        table_url: &str,
-    ) -> FlightMetadata {
-        let mut client = FlightSqlServiceClient::new(channel);
-        let request = CommandGetDbSchemas {
-            db_schema_filter_pattern: Some(table_name.to_string()),
-            catalog: Some(table_url.to_string()),
-        };
-        let info = client.get_db_schemas(request).await.unwrap();
-        FlightMetadata::from_info(info)
-    }
-
-    pub async fn run_sql(&self, channel: Channel, sql: &str) -> FlightMetadata {
-        let mut client = FlightSqlServiceClient::new(channel);
-        let info = client.execute(sql.to_string(), None).await.unwrap();
-        FlightMetadata::from_info(info)
-    }
-}
-
 #[derive(Debug)]
-pub struct PushdownTable {
-    driver: Arc<FlightSqlDriver>,
+pub struct FlightTable {
     channel: Channel,
-    origin: String,
+    server: String,
     table_name: TableReference,
-    output_schema: SchemaRef,
+    schema: SchemaRef,
 }
 
-impl PushdownTable {
+impl FlightTable {
     pub async fn create(server: &str, table_name: &str, table_url: &str) -> Self {
         let channel = flight_channel(server).await.unwrap();
-        let driver = Arc::new(FlightSqlDriver {});
-        let metadata = driver
-            .metadata(channel.clone(), table_name, table_url)
-            .await;
+
+        let metadata = {
+            let mut client = FlightSqlServiceClient::new(channel.clone());
+            let request = CommandGetDbSchemas {
+                db_schema_filter_pattern: Some(table_name.to_string()),
+                catalog: Some(table_url.to_string()),
+            };
+            let info = client.get_db_schemas(request).await.unwrap();
+            info
+        };
 
         Self {
-            driver,
             channel,
-            origin: server.to_string(),
+            server: server.to_string(),
             table_name: table_name.to_string().into(),
-            output_schema: metadata.schema,
+            schema: Arc::new(metadata.try_decode_schema().unwrap()),
         }
     }
 }
 
 #[async_trait]
-impl TableProvider for PushdownTable {
+impl TableProvider for FlightTable {
     fn as_any(&self) -> &dyn Any {
         self
     }
 
     fn schema(&self) -> SchemaRef {
-        self.output_schema.clone()
+        self.schema.clone()
     }
 
     fn table_type(&self) -> TableType {
@@ -352,19 +301,16 @@ impl TableProvider for PushdownTable {
             unparsed_sql.to_string()
         };
 
-        println!("SQL send to cache: \n{}", unparsed_sql);
+        println!("SQL send to storage: \n{}", unparsed_sql);
 
-        let metadata = self
-            .driver
-            .run_sql(self.channel.clone(), &unparsed_sql)
-            .await;
+        let mut client = FlightSqlServiceClient::new(self.channel.clone());
+        let info = client.execute(unparsed_sql, None).await.unwrap();
 
         Ok(Arc::new(FlightExec::try_new(
-            self.output_schema.clone(),
-            metadata,
+            self.schema.clone(),
+            info,
             projection,
-            &self.origin,
-            limit,
+            &self.server,
         )?))
     }
 
@@ -402,7 +348,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "SELECT DISTINCT \"city\" FROM \"{table_name}\" WHERE \"country\" = 'United States'"
     );
 
-    let table = PushdownTable::create(cache_server, table_name, table_url).await;
+    let table = FlightTable::create(cache_server, table_name, table_url).await;
     ctx.register_table(table_name, Arc::new(table))?;
     ctx.sql(&sql).await?.show().await?;
     Ok(())

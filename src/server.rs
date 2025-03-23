@@ -19,15 +19,15 @@ use std::{
 use tonic::{Request, Response, Status, transport::Server};
 
 #[derive(Default)]
-struct PushdownServer {
+struct StorageServer {
     execution_plans: Mutex<HashMap<u64, Arc<dyn ExecutionPlan>>>,
     next_id: atomic::AtomicU64,
     ctx: SessionContext,
 }
 
 #[tonic::async_trait]
-impl FlightSqlService for PushdownServer {
-    type FlightService = PushdownServer;
+impl FlightSqlService for StorageServer {
+    type FlightService = StorageServer;
 
     async fn register_sql_info(&self, _id: i32, _result: &arrow_flight::sql::SqlInfo) {}
 
@@ -52,7 +52,6 @@ impl FlightSqlService for PushdownServer {
         cmd: CommandStatementQuery,
         _request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        println!("planing query");
         let query = cmd.query.as_str();
         let (state, logical_plan) = self.ctx.sql(query).await.unwrap().into_parts();
         let plan = state.optimize(&logical_plan).unwrap();
@@ -123,7 +122,7 @@ impl ProstMessageExt for FetchResults {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = "127.0.0.1:50051".parse()?;
     Server::builder()
-        .add_service(FlightServiceServer::new(PushdownServer::default()))
+        .add_service(FlightServiceServer::new(StorageServer::default()))
         .serve(addr)
         .await?;
     Ok(())
