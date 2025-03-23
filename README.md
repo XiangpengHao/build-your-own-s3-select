@@ -36,6 +36,15 @@ SELECT "aws-edge-locations"."city" FROM "aws-edge-locations" WHERE ("aws-edge-lo
 ```
 
 
+### Lines of code
+
+Note that we have more than 50 lines of imports.
+```
+===============================================================================
+ Language            Files        Lines         Code     Comments       Blanks
+===============================================================================
+ Rust                    2          484          431            1           52
+```
 
 
 
