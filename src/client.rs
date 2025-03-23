@@ -247,8 +247,7 @@ impl FlightTable {
                 db_schema_filter_pattern: Some(table_name.to_string()),
                 catalog: Some(table_url.to_string()),
             };
-            let info = client.get_db_schemas(request).await.unwrap();
-            info
+            client.get_db_schemas(request).await.unwrap()
         };
 
         Self {
