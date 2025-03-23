@@ -1,4 +1,4 @@
-This is the source code of my blog: [Build your own S3-Select in 400 lines of Rust](https://blog.xiangpeng.systems/posts/build-s3-select/).
+The source code of my blog: [Build your own S3-Select in 400 lines of Rust](https://blog.xiangpeng.systems/posts/build-s3-select/).
 
 ### Install Rust
 
@@ -18,20 +18,29 @@ cargo run --bin server
 cargo run --bin client
 ```
 
-You should see the following output:
+You should see the following output. 
+Note the SQL to pushdown only contains filters and projection, i.e., no `DISTINCT` or `GROUP BY`.
 
 ```bash
-SQL send to storage: 
+SQL to run: 
+-------
+SELECT DISTINCT "city" FROM "aws-edge-locations" WHERE "country" = 'United States'
+-------
+
+SQL to pushdown: 
+-------
 SELECT "aws-edge-locations"."city" FROM "aws-edge-locations" WHERE ("aws-edge-locations"."country" = 'United States')
+-------
+
 +----------------+
 | city           |
 +----------------+
+| Boston         |
+| Chicago        |
+| Portland       |
 | New York       |
 | Newark         |
-| Miami          |
-| Philadelphia   |
-| Denver         |
-| Houston        |
+| Detroit        |
 ...
 ```
 

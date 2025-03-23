@@ -300,7 +300,7 @@ impl TableProvider for FlightTable {
             unparsed_sql.to_string()
         };
 
-        println!("SQL send to storage: \n{}", unparsed_sql);
+        println!("SQL to pushdown: \n-------\n{}\n-------\n", unparsed_sql);
 
         let mut client = FlightSqlServiceClient::new(self.channel.clone());
         let info = client.execute(unparsed_sql, None).await.unwrap();
@@ -346,7 +346,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sql = format!(
         "SELECT DISTINCT \"city\" FROM \"{table_name}\" WHERE \"country\" = 'United States'"
     );
-
+    println!("SQL to run: \n-------\n{}\n-------\n", sql);
     let table = FlightTable::create(cache_server, table_name, table_url).await;
     ctx.register_table(table_name, Arc::new(table))?;
     ctx.sql(&sql).await?.show().await?;
